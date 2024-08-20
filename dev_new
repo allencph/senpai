@@ -1,0 +1,199 @@
+import pandas as pd
+from langgraph.graph import StateGraph
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from langchain_core.language_models import BaseChatModel
+from langgraph.checkpoint.sqlite import SqliteSaver
+from typing import List, TypedDict
+
+# 定義狀態字典類型，用於保存每個客戶的狀態信息
+class CustomerState(TypedDict):
+    news_content: str  # 輸入的新聞內容
+    customer_features: List[str]  # 客戶特徵列表
+    extracted_features: str  # 提取的客戶特徵摘要
+    news_summary: str  # 基於客戶特徵的新聞摘要
+    investment_advice_result: str  # 生成的投資建議
+
+# 定義個性化新聞代理類
+class PersonalizedNewsAgent:
+
+    # 初始化方法，創建StateGraph，並添加節點和邊
+    def __init__(self, model: BaseChatModel, checkpointer: SqliteSaver):
+        self.model = model  # 初始化生成式語言模型
+        self.checkpointer = checkpointer  # 初始化檢查點保存器，用於保存狀態
+        builder = StateGraph(CustomerState)  # 創建StateGraph並傳入狀態字典類型
+        builder.add_node("initialize", self.initialize_node)  # 添加初始化節點
+        builder.add_node("extract_customer_features", self.extract_customer_features_node)  # 添加客戶特徵提取節點
+        builder.add_node("personalized_news_summary", self.personalized_news_summary_node)  # 添加個性化新聞摘要節點
+        builder.add_node("investment_advice", self.investment_advice_node)  # 添加投資建議節點
+        builder.add_node("output_results", self.output_results_node)  # 添加輸出結果節點
+
+        builder.set_entry_point("initialize")  # 設置初始節點為“initialize”
+        builder.add_edge("initialize", "extract_customer_features")  # 定義節點之間的邊，連接初始化節點和特徵提取節點
+        builder.add_edge("extract_customer_features", "personalized_news_summary")  # 連接特徵提取節點和新聞摘要節點
+        builder.add_edge("personalized_news_summary", "investment_advice")  # 連接新聞摘要節點和投資建議節點
+        builder.add_edge("investment_advice", "output_results")  # 連接投資建議節點和輸出結果節點
+        self.graph = builder.compile(checkpointer=checkpointer)  # 編譯圖結構，準備執行
+
+    # 初始化節點，用於重置狀態
+    def initialize_node(self, state: CustomerState):
+        return {
+            "extracted_features": "",  # 初始化提取的客戶特徵為空
+            "news_summary": "",  # 初始化新聞摘要為空
+            "investment_advice_result": "",  # 初始化投資建議為空
+        }
+
+    # 提取客戶特徵節點，生成客戶特徵摘要
+    def extract_customer_features_node(self, state: CustomerState):
+        customer_features_text = "\n".join(state["customer_features"])  # 將客戶特徵列表合併為一個字符串
+        messages = [
+            SystemMessage(content="請提取客戶特徵摘要。請確保摘要內容完全來自以下客戶特徵信息，不參考其他來源。"),  # 系統消息：提示只使用給定信息
+            HumanMessage(content=customer_features_text),  # 輸入消息：客戶特徵文本
+        ]
+        response = self.model.invoke(messages)  # 調用模型生成客戶特徵摘要
+        state["extracted_features"] = response.content.strip()  # 將生成的特徵摘要保存到狀態中
+        return {"extracted_features": state["extracted_features"]}
+
+    # 個性化新聞摘要節點，生成基於客戶特徵的新聞摘要
+    def personalized_news_summary_node(self, state: CustomerState):
+        messages = [
+            SystemMessage(content="請用中文回答。生成基於客戶特徵的200字新聞摘要。請確保摘要完全基於以下新聞內容，不參考其他來源。"),  # 系統消息：提示只使用給定新聞內容
+            HumanMessage(content=state["news_content"]),  # 輸入消息：新聞內容
+            AIMessage(content=f"客戶特徵: {state['extracted_features']}"),  # 輸入消息：提取的客戶特徵摘要
+        ]
+        response = self.model.invoke(messages)  # 調用模型生成新聞摘要
+        state["news_summary"] = response.content.strip()  # 將生成的新聞摘要保存到狀態中
+        return {"news_summary": state["news_summary"]}
+
+    # 投資建議節點，生成基於客戶特徵和新聞摘要的投資建議
+    def investment_advice_node(self, state: CustomerState):
+        messages = [
+            SystemMessage(content="根據以下客戶特徵和新聞摘要，生成一個詳細的投資建議，直接給出具體的建議，大約200字內："),  # 系統消息：生成投資建議
+            AIMessage(content=f"客戶特徵: {state['extracted_features']}"),  # 輸入消息：提取的客戶特徵摘要
+            AIMessage(content=f"新聞摘要: {state['news_summary']}"),  # 輸入消息：生成的新聞摘要
+        ]
+        response = self.model.invoke(messages)  # 調用模型生成投資建議
+        state["investment_advice_result"] = response.content.strip()  # 將生成的投資建議保存到狀態中
+        return {"investment_advice_result": state["investment_advice_result"]}
+
+    # 輸出結果節點，將所有生成的結果彙總並返回
+    def output_results_node(self, state: CustomerState):
+        return {
+            "extracted_features": state["extracted_features"],  # 返回提取的客戶特徵
+            "news_summary": state["news_summary"],  # 返回生成的新聞摘要
+            "investment_advice_result": state["investment_advice_result"],  # 返回生成的投資建議
+        }
+
+# 初始化模型和檢查點保存器
+model = ChatGoogleGenerativeAI(model="gemini-1.5-pro")  # 使用Google Generative AI模型
+memory = SqliteSaver.from_conn_string(":memory:")  # 使用SQLite內存數據庫保存狀態
+
+bot = PersonalizedNewsAgent(model=model, checkpointer=memory)  # 創建個性化新聞代理實例
+
+thread = {"configurable": {"thread_id": "1"}}  # 定義線程ID以管理多個客戶的狀態
+
+# 定義輸入的新聞內容和客戶特徵
+state = {
+    "news_content": """7/31日本央行決定將基準利率調升15個基點，從
+0%~0.10%升至0.15%-0.25%，並計劃每季減少
+購債約4,000億日圓，升息令套利交易平倉賣壓出
+籠，輔以美國7月非農數據驟降至11.4萬人與7月
+ISM製造業數據低於預期，避險情緒推升美元兌日
+圓8/5盤中一度跌破145大關。
+
+在日本央行升息後，日本公債殖利率上升、推升
+日圓升值，帶動亞洲多數幣別月迄今皆升值。短
+線在科技股回檔及中東情勢升溫下，避險情緒主
+導料將令日圓短線持續偏強勢。
+
+07/31 BOJ升息15個Bp至0.25%，展現朝向貨幣政
+策正常化的決心。同時宣布開啟量化緊縮，加上投
+資人對於美國經濟衰退擔憂再起，風險意識升高。
+導致日股急跌，原本強勢的金融類股也面臨補跌，
+日經指數創半年新低。
+
+升息導致日圓急升後，外銷類股面臨沉重賣壓，
+同時外資撒資日股，數據顯示，截至7月26日當周，
+外資淨賣出6,705億日圓的日本股票。
+
+美國7月新增非農就業遠差於預期，失業率升至4.3
+％，數據觸發「薩姆法則」預告的經濟衰退，市場
+恐慌情緒蔓延。台股5日殺聲震天，終場大跌1807
+點，為史上最大跌點，收19830.88點，跌幅8.35
+％，成交量6407.93億元。
+
+股價提前反應基本面，第2季股價大漲者基本面佳，
+財報反應利多鈍化，展望樂觀仍難抵龐大獲利賣壓，
+台積電*(2330)法說會後股價回檔，受到美國政治
+與政策不確定因素干擾，亞股當中漲幅較高的日股
+及台股面臨獲利調節賣壓。
+
+8/5台股出現全面性殺盤，恐慌情緒濃厚，類股方
+面主要以先前漲多的營造、電子股跌幅較重，重點
+權值-台積電、鴻海、聯發科、廣達*跌幅都超過9%
+以上。Nvidia*Blackwell量產可能延期，疊加經濟
+衰退風險，重創今年漲高的電子族群。
+
+由於美國經濟與通膨明顯降溫，聯準會9月降息勢
+在必行，利多美債與高評級債券。另一方面，考
+量投資信心薄弱，股市下方風險仍高，衛星宜加
+碼醫療與公用事業等防禦類股。同時也建議加碼
+黃金、增持現金以控制投資組合波動度，降低投
+資風險。""",
+    "customer_features": [
+        "客戶A, 交易量大，一年總交易量約2000萬，喜歡追求風險資產，大多投資地區別為大中華股票。",
+        "客戶B, 交易量小，一年總交易量約10萬，一年僅交易一次，投資標的為美債。",
+    ]
+}
+
+# 格式化輸出函數，將每個客戶的結果格式化為易於閱讀的文本
+def format_output_for_customer(customer_name, features, summary, advice):
+    # 清除多餘的前後綴信息
+    summary = summary.replace("## 新聞摘要", "").strip()
+    advice = advice.replace("## 投資建議", "").strip()
+    return f"### {customer_name}\n\n" \
+           f"**客戶特徵:**\n{features}\n\n" \
+           f"**新聞摘要:**\n{summary}\n\n" \
+           f"**投資建議:**\n{advice}\n"
+
+# 存儲所有客戶的輸出結果
+all_customers_output = []
+all_customers_data = []
+
+# 單獨處理每個客戶的信息
+for i, customer_feature in enumerate(state["customer_features"]):
+    # 重置狀態中的結果部分以避免之前的結果混入
+    state["extracted_features"] = ""
+    state["news_summary"] = ""
+    state["investment_advice_result"] = ""
+
+    # 提取單個客戶特徵
+    state["customer_features"] = [customer_feature]
+
+    # 執行圖形流程
+    result = bot.graph.invoke(state, thread)
+
+    # 獲取客戶名稱
+    customer_name = customer_feature.split(",")[0].strip()
+
+    # 格式化每個客戶的結果
+    customer_output = format_output_for_customer(customer_name, result["extracted_features"], result["news_summary"], result["investment_advice_result"])
+    
+    # 保存每個客戶的結果
+    all_customers_output.append(customer_output)
+
+    # 存儲表格數據
+    all_customers_data.append({
+        "客戶": customer_name,
+        "客戶特徵": result["extracted_features"],
+        "新聞摘要": result["news_summary"],
+        "投資建議": result["investment_advice_result"]
+    })
+
+# 創建DataFrame並輸出到Excel
+df = pd.DataFrame(all_customers_data)
+df.to_excel("Personalized_Investment_Advice.xlsx", index=False)
+
+# 輸出所有客戶的結果
+for output in all_customers_output:
+    print(output)
+    print("---")  # 分隔線
