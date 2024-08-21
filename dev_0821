@@ -1,0 +1,216 @@
+import pandas as pd
+from langgraph.graph import StateGraph
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from langchain_core.language_models import BaseChatModel
+from langgraph.checkpoint.sqlite import SqliteSaver
+from langchain_google_genai import ChatGoogleGenerativeAI
+from typing import List, TypedDict
+
+# 定義狀態字典類型，用於保存每個客戶的狀態信息
+class CustomerState(TypedDict):
+    news_content: str  # 輸入的新聞內容
+    customer_features: List[str]  # 客戶特徵列表
+    extracted_features: str  # 提取的客戶特徵摘要
+    news_summary: str  # 基於客戶特徵的新聞摘要
+    investment_advice_result: str  # 生成的投資建議
+
+# 定義個性化新聞代理類
+class PersonalizedNewsAgent:
+
+    def __init__(self, model: BaseChatModel, checkpointer: SqliteSaver):
+        self.model = model  # 初始化生成式語言模型
+        self.checkpointer = checkpointer  # 初始化檢查點保存器，用於保存狀態
+        builder = StateGraph(CustomerState)  # 創建StateGraph並傳入狀態字典類型
+        builder.add_node("initialize", self.initialize_node)
+        builder.add_node("extract_customer_features", self.extract_customer_features_node)
+        builder.add_node("personalized_news_summary", self.personalized_news_summary_node)
+        builder.add_node("investment_advice", self.investment_advice_node)
+        builder.add_node("output_results", self.output_results_node)
+
+        builder.set_entry_point("initialize")
+        builder.add_edge("initialize", "extract_customer_features")
+        builder.add_edge("extract_customer_features", "personalized_news_summary")
+        builder.add_edge("personalized_news_summary", "investment_advice")
+        builder.add_edge("investment_advice", "output_results")
+        self.graph = builder.compile(checkpointer=checkpointer)
+
+    def initialize_node(self, state: CustomerState):
+        return {
+            "extracted_features": "",
+            "news_summary": "",
+            "investment_advice_result": "",
+        }
+
+    def extract_customer_features_node(self, state: CustomerState):
+        customer_features_text = "\n".join(state["customer_features"])
+        messages = [
+            SystemMessage(content="請提取客戶特徵摘要。請確保摘要內容完全來自以下客戶特徵信息，不參考其他來源。"),
+            HumanMessage(content=customer_features_text),
+        ]
+        response = self.model.invoke(messages)
+        state["extracted_features"] = response.content.strip()
+        return {"extracted_features": state["extracted_features"]}
+
+    def personalized_news_summary_node(self, state: CustomerState):
+        messages = [
+            SystemMessage(content="請根據以下新聞內容生成200字以內的摘要，不要包括任何客戶特徵信息，只聚焦新聞本身。"),
+            HumanMessage(content=state["news_content"])
+        ]
+        response = self.model.invoke(messages)
+        state["news_summary"] = response.content.strip()
+        return {"news_summary": state["news_summary"]}
+
+    def investment_advice_node(self, state: CustomerState):
+        messages = [
+            SystemMessage(content="根據以下客戶特徵和新聞摘要，生成一個詳細的投資建議，直接給出具體的建議，大約200字內："),
+            AIMessage(content=f"客戶特徵: {state['extracted_features']}"),
+            AIMessage(content=f"新聞摘要: {state['news_summary']}"),
+        ]
+        response = self.model.invoke(messages)
+        state["investment_advice_result"] = response.content.strip()
+        return {"investment_advice_result": state["investment_advice_result"]}
+
+    def output_results_node(self, state: CustomerState):
+        return {
+            "extracted_features": state["extracted_features"],
+            "news_summary": state["news_summary"],
+            "investment_advice_result": state["investment_advice_result"],
+        }
+
+# 初始化模型和檢查點保存器
+model = ChatGoogleGenerativeAI(model="gemini-1.5-pro")
+memory = SqliteSaver.from_conn_string(":memory:")
+
+bot = PersonalizedNewsAgent(model=model, checkpointer=memory)
+
+thread = {"configurable": {"thread_id": "1"}}
+
+# 定義輸入的新聞內容和客戶特徵
+state = {
+    "news_content": """7/31日本央行決定將基準利率調升15個基點，從
+0%~0.10%升至0.15%-0.25%，並計劃每季減少
+購債約4,000億日圓，升息令套利交易平倉賣壓出
+籠，輔以美國7月非農數據驟降至11.4萬人與7月
+ISM製造業數據低於預期，避險情緒推升美元兌日
+圓8/5盤中一度跌破145大關。
+
+在日本央行升息後，日本公債殖利率上升、推升
+日圓升值，帶動亞洲多數幣別月迄今皆升值。短
+線在科技股回檔及中東情勢升溫下，避險情緒主
+導料將令日圓短線持續偏強勢。
+
+07/31 BOJ升息15個Bp至0.25%，展現朝向貨幣政
+策正常化的決心。同時宣布開啟量化緊縮，加上投
+資人對於美國經濟衰退擔憂再起，風險意識升高。
+導致日股急跌，原本強勢的金融類股也面臨補跌，
+日經指數創半年新低。
+
+升息導致日圓急升後，外銷類股面臨沉重賣壓，
+同時外資撒資日股，數據顯示，截至7月26日當周，
+外資淨賣出6,705億日圓的日本股票。
+
+美國7月新增非農就業遠差於預期，失業率升至4.3
+％，數據觸發「薩姆法則」預告的經濟衰退，市場
+恐慌情緒蔓延。台股5日殺聲震天，終場大跌1807
+點，為史上最大跌點，收19830.88點，跌幅8.35
+％，成交量6407.93億元。
+
+股價提前反應基本面，第2季股價大漲者基本面佳，
+財報反應利多鈍化，展望樂觀仍難抵龐大獲利賣壓，
+台積電*(2330)法說會後股價回檔，受到美國政治
+與政策不確定因素干擾，亞股當中漲幅較高的日股
+及台股面臨獲利調節賣壓。
+
+8/5台股出現全面性殺盤，恐慌情緒濃厚，類股方
+面主要以先前漲多的營造、電子股跌幅較重，重點
+權值-台積電、鴻海、聯發科、廣達*跌幅都超過9%
+以上。Nvidia*Blackwell量產可能延期，疊加經濟
+衰退風險，重創今年漲高的電子族群。
+
+由於美國經濟與通膨明顯降溫，聯準會9月降息勢
+在必行，利多美債與高評級債券。另一方面，考
+量投資信心薄弱，股市下方風險仍高，衛星宜加
+碼醫療與公用事業等防禦類股。同時也建議加碼
+黃金、增持現金以控制投資組合波動度，降低投
+資風險。""",
+    "customer_features": []
+}
+
+customers_data = [
+    {
+        "name": "A客戶",
+        "features": [
+            "近一年總成交量636萬，股票類90%，債券類3%，平衡類7%；其中，股票類交易量依序為中國股票21%，台灣股票20%，科技股13%，大中華股票10%，全球平衡類7%，剩下包含印度股票、亞太股票、日本股票、美債、能源股票、高收益債、黃金、礦業股票等。",
+            "近一年總成交次數85次，股票類佔88%，債券類4%，平衡類8%；其中，交易次數依序為台灣股票25%，中國股票15%，科技股票13%，全球平衡8%，大中華股票7%，剩下包含印度股票、亞太股票、日本股票、美債、能源股票、高收益債、黃金、礦業股票等。",
+            "庫存量206萬，股票類佔70%，債券類佔9%，平衡類佔21%。其中，庫存量依序為全球平衡20%，印度股票5%，礦業股票4%，剩下包含日本股票、美債、能源股票、高收益債、黃金、礦業股票等。",
+            "投資標的的風險報酬等級RR1佔0%，RR2佔2%，RR3佔10%，RR4佔36%，RR5佔52%(RR5為風險等級最高，RR1為風險等級最低最安全)。"
+        ]
+    },
+    {
+        "name": "B客戶",
+        "features": [
+            "近一年總成交量10萬，股票類0%，債券類100%，平衡類0%；美債佔比100%。",
+            "近一年總成交次數1次，股票類佔0%，債券類100%，平衡類0%；美債佔比100%。",
+            "庫存量10萬，股票類佔0%，債券類佔100%，平衡類佔0%；債券類庫存美債佔100%。",
+            "風險報酬等級RR1佔0%，RR2佔100%，RR3佔0%，RR4佔0%，RR5佔0%(RR5為風險等級最高，RR1為風險等級最低最安全)。"
+        ]
+    },
+    {
+        "name": "C客戶",
+        "features": [
+            "近一年總成交量約2207萬，股票類0%，債券類60%，平衡類40%；其中，交易量依序為全球平衡40%，全球債25%，美債16%，高收益債10%，新興市場債10%。",
+            "近一年總成交次數13次，股票類佔0%，債券類62%，平衡類38%；其中，成交次數依序為全球平衡類38%，全球債23%，美債23%，高收益債8%，新興債8%。",
+            "庫存量約1216萬，股票類佔0%，債券類佔67%，平衡類佔33%。其中，庫存量依序為全球債佔28%，全球平衡佔22%，美債17%，高收益債11%。",
+            "風險報酬等級RR1佔0%，RR2佔43%，RR3佔57%，RR4佬0%，RR5佔0%。(RR5為風險等級最高，RR1為風險等級最低最安全)。"
+        ]
+    }
+]
+
+all_customers_output = []
+all_customers_data = []
+
+# 單獨處理每個客戶的信息
+for customer in customers_data:
+    customer_name = customer["name"]
+    customer_features = customer["features"]
+
+    state["extracted_features"] = ""
+    state["news_summary"] = ""
+    state["investment_advice_result"] = ""
+
+    state["customer_features"] = customer_features
+
+    result = bot.graph.invoke(state, thread)
+
+    # 檢查生成的投資建議是否為空，如果是空的，給予警告並記錄
+    if not result["investment_advice_result"]:
+        print(f"警告: {customer_name} 的投資建議生成為空！")
+
+    customer_output = format_output_for_customer(customer_name, result["extracted_features"], result["news_summary"], result["investment_advice_result"])
+    
+    all_customers_output.append(customer_output)
+
+    all_customers_data.append({
+        "客戶": customer_name,
+        "客戶特徵": result["extracted_features"],
+        "新聞摘要": result["news_summary"],
+        "投資建議": result["investment_advice_result"]
+    })
+
+# 創建DataFrame並輸出到Excel
+df = pd.DataFrame(all_customers_data)
+with pd.ExcelWriter("Personalized_Investment_Advice.xlsx", engine="openpyxl") as writer:
+    df.to_excel(writer, sheet_name="Sheet1", index=False)
+    worksheet = writer.sheets["Sheet1"]
+    
+    # 調整欄位寬度
+    for i, col in enumerate(df.columns):
+        max_width = max(df[col].astype(str).map(len).max(), len(col)) + 2
+        worksheet.column_dimensions[get_column_letter(i + 1)].width = max_width
+    
+    # 文字換行
+    for row in worksheet.iter_rows():
+        for cell in row:
+            cell.alignment = Alignment(wrap_text=True)
+
+print("Excel 文件已更新，請檢查結果。")
